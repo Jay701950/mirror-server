@@ -1,24 +1,27 @@
+const http = require("http");
 const WebSocket = require("ws");
 
-/* =========================
-   서버 생성
-========================= */
 const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
 
-console.log("Signaling server running on port", PORT);
+/* HTTP (Render용) */
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("WebSocket server running");
+});
 
-/* =========================
-   방 관리
-========================= */
-// rooms = {
-//   roomCode: Set<WebSocket>
-// }
+/* WebSocket */
+const wss = new WebSocket.Server({ server });
+
+/*
+rooms = {
+  roomCode: {
+    clients: Set<WebSocket>,
+    offer: RTCSessionDescription
+  }
+}
+*/
 const rooms = {};
 
-/* =========================
-   연결 처리
-========================= */
 wss.on("connection", (ws) => {
   ws.room = null;
 
@@ -32,38 +35,55 @@ wss.on("connection", (ws) => {
 
     const { type, room } = msg;
 
-    /* ===== 방 참가 ===== */
+    /* ===== 참가 ===== */
     if (type === "join") {
       ws.room = room;
 
       if (!rooms[room]) {
-        rooms[room] = new Set();
+        rooms[room] = {
+          clients: new Set(),
+          offer: null
+        };
       }
 
-      rooms[room].add(ws);
+      rooms[room].clients.add(ws);
+
+      /* 🔥 핵심: 이미 공유 중이면 offer 즉시 전송 */
+      if (rooms[room].offer) {
+        ws.send(JSON.stringify({
+          type: "offer",
+          offer: rooms[room].offer
+        }));
+      }
       return;
     }
 
-    /* ===== 중계 ===== */
     if (!ws.room || !rooms[ws.room]) return;
 
-    rooms[ws.room].forEach((client) => {
+    /* ===== offer 저장 ===== */
+    if (type === "offer") {
+      rooms[ws.room].offer = msg.offer;
+    }
+
+    /* ===== 방 안에 중계 ===== */
+    rooms[ws.room].clients.forEach(client => {
       if (client !== ws && client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify(msg));
       }
     });
   });
 
-  /* =========================
-     연결 종료
-  ========================= */
   ws.on("close", () => {
     const room = ws.room;
     if (!room || !rooms[room]) return;
 
-    rooms[room].delete(ws);
-    if (rooms[room].size === 0) {
+    rooms[room].clients.delete(ws);
+    if (rooms[room].clients.size === 0) {
       delete rooms[room];
     }
   });
+});
+
+server.listen(PORT, () => {
+  console.log("Server running on", PORT);
 });
