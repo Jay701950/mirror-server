@@ -1,116 +1,69 @@
 const WebSocket = require("ws");
 
+/* =========================
+   서버 생성
+========================= */
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({ port: PORT });
 
-console.log("Signaling server running : ws://localhost:" + PORT);
+console.log("Signaling server running on port", PORT);
 
-// roomCode -> Set of clients
+/* =========================
+   방 관리
+========================= */
+// rooms = {
+//   roomCode: Set<WebSocket>
+// }
 const rooms = {};
 
-function generateRoomCode() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
-
+/* =========================
+   연결 처리
+========================= */
 wss.on("connection", (ws) => {
-  let currentRoom = null;
+  ws.room = null;
 
-  ws.on("message", (message) => {
-    let data;
+  ws.on("message", (data) => {
+    let msg;
     try {
-      data = JSON.parse(message);
-    } catch (e) {
+      msg = JSON.parse(data);
+    } catch {
       return;
     }
 
-    // =========================
-    // 방 생성 (호스트)
-    // =========================
-    if (data.type === "create-room") {
-      const roomCode = generateRoomCode();
-      rooms[roomCode] = new Set();
-      rooms[roomCode].add(ws);
-      currentRoom = roomCode;
+    const { type, room } = msg;
 
-      ws.send(
-        JSON.stringify({
-          type: "room-created",
-          roomCode,
-        })
-      );
-      return;
-    }
+    /* ===== 방 참가 ===== */
+    if (type === "join") {
+      ws.room = room;
 
-    // =========================
-    // 방 참가 (시청자)
-    // =========================
-    if (data.type === "join-room") {
-      const { roomCode } = data;
-
-      if (!rooms[roomCode]) {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: "방이 존재하지 않습니다",
-          })
-        );
-        return;
+      if (!rooms[room]) {
+        rooms[room] = new Set();
       }
 
-      rooms[roomCode].add(ws);
-      currentRoom = roomCode;
-
-      // 참가자에게 참가 완료 알림
-      ws.send(
-        JSON.stringify({
-          type: "joined-room",
-          roomCode,
-        })
-      );
-
-      // 🔥 방장에게 참가자 들어왔음을 알림
-      rooms[roomCode].forEach((client) => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(
-            JSON.stringify({
-              type: "peer-joined",
-            })
-          );
-        }
-      });
-
+      rooms[room].add(ws);
       return;
     }
 
-    // =========================
-    // WebRTC 시그널 중계
-    // =========================
-    if (
-      data.type === "offer" ||
-      data.type === "answer" ||
-      data.type === "ice"
-    ) {
-      if (!currentRoom || !rooms[currentRoom]) return;
+    /* ===== 중계 ===== */
+    if (!ws.room || !rooms[ws.room]) return;
 
-      rooms[currentRoom].forEach((client) => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify(data));
-        }
-      });
-      return;
-    }
+    rooms[ws.room].forEach((client) => {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify(msg));
+      }
+    });
   });
 
-  // =========================
-  // 연결 종료 처리
-  // =========================
+  /* =========================
+     연결 종료
+  ========================= */
   ws.on("close", () => {
-    if (currentRoom && rooms[currentRoom]) {
-      rooms[currentRoom].delete(ws);
+    const room = ws.room;
+    if (!room || !rooms[room]) return;
 
-      if (rooms[currentRoom].size === 0) {
-        delete rooms[currentRoom];
-      }
+    rooms[room].delete(ws);
+    if (rooms[room].size === 0) {
+      delete rooms[room];
     }
   });
 });
