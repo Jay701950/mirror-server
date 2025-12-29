@@ -1,174 +1,135 @@
-const http = require("http");
+// ==============================
+// WebSocket Signaling Server
+// ==============================
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
+const wss = new WebSocket.Server({ port: PORT });
 
-/* =========================
-   HTTP (상태 확인용)
-========================= */
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Signaling server running");
-});
-
-/* =========================
-   WebSocket
-========================= */
-const wss = new WebSocket.Server({ server });
-
-/*
-rooms = {
-  roomCode: {
-    host: WebSocket,
-    peers: Set<WebSocket>
-  }
-}
-*/
+// 방 목록
+// rooms = {
+//   "12": { host: ws, guest: ws }
+// }
 const rooms = {};
 
-/* =========================
-   연결
-========================= */
-wss.on("connection", (ws) => {
-  ws.roomCode = null;
-  ws.isHost = false;
+// ------------------------------
+// 2자리 숫자 방 코드 생성
+// ------------------------------
+function createRoomCode() {
+  return Math.floor(Math.random() * 100)
+    .toString()
+    .padStart(2, "0"); // 00 ~ 99
+}
 
-  ws.on("message", (data) => {
-    let msg;
+// ------------------------------
+// WebSocket 연결
+// ------------------------------
+wss.on("connection", (ws) => {
+
+  ws.on("message", (msg) => {
+    let data;
     try {
-      msg = JSON.parse(data);
+      data = JSON.parse(msg);
     } catch {
       return;
     }
 
-    /* =========================
-       방 생성
-    ========================= */
-    if (msg.type === "create-room") {
-      const roomCode = Math.random().toString(36).substring(2, 8);
+    // ==========================
+    // 방 생성
+    // ==========================
+    if (data.type === "create-room") {
+      let code;
 
-      rooms[roomCode] = {
-        host: ws,
-        peers: new Set()
-      };
+      // 중복 방 피하기
+      do {
+        code = createRoomCode();
+      } while (rooms[code]);
 
-      ws.roomCode = roomCode;
-      ws.isHost = true;
+      rooms[code] = { host: ws, guest: null };
+      ws.roomCode = code;
+      ws.role = "host";
 
       ws.send(JSON.stringify({
         type: "room-created",
-        roomCode
+        roomCode: code
       }));
-
-      return;
     }
 
-    /* =========================
-       방 참가
-    ========================= */
-    if (msg.type === "join-room") {
-      const room = rooms[msg.roomCode];
-      if (!room) {
+    // ==========================
+    // 방 참가
+    // ==========================
+    if (data.type === "join-room") {
+      const code = data.roomCode;
+
+      if (!rooms[code] || rooms[code].guest) {
         ws.send(JSON.stringify({
           type: "error",
-          message: "Room not found"
+          message: "방이 없거나 이미 참가자가 있습니다"
         }));
         return;
       }
 
-      ws.roomCode = msg.roomCode;
-      ws.isHost = false;
-      room.peers.add(ws);
+      rooms[code].guest = ws;
+      ws.roomCode = code;
+      ws.role = "guest";
 
       ws.send(JSON.stringify({
         type: "joined-room",
-        roomCode: msg.roomCode
+        roomCode: code
       }));
 
-      /* 🔥 호스트에게 참가 알림 */
-      if (room.host && room.host.readyState === WebSocket.OPEN) {
-        room.host.send(JSON.stringify({
-          type: "peer-joined"
-        }));
-      }
-
-      return;
+      // 호스트에게 참가자 입장 알림
+      rooms[code].host.send(JSON.stringify({
+        type: "peer-joined"
+      }));
     }
 
-    /* =========================
-       이후는 방 필요
-    ========================= */
-    const room = rooms[ws.roomCode];
-    if (!room) return;
+    // ==========================
+    // WebRTC Signaling 중계
+    // ==========================
+    if (
+      data.type === "offer" ||
+      data.type === "answer" ||
+      data.type === "ice"
+    ) {
+      const code = ws.roomCode;
+      if (!code || !rooms[code]) return;
 
-    /* =========================
-       WebRTC 중계
-    ========================= */
-    if (msg.type === "offer") {
-      // host → peers
-      room.peers.forEach(peer => {
-        if (peer.readyState === WebSocket.OPEN) {
-          peer.send(JSON.stringify({
-            type: "offer",
-            offer: msg.offer
-          }));
-        }
-      });
-    }
+      const room = rooms[code];
+      const target =
+        ws.role === "host" ? room.guest : room.host;
 
-    if (msg.type === "answer") {
-      // peer → host
-      if (room.host && room.host.readyState === WebSocket.OPEN) {
-        room.host.send(JSON.stringify({
-          type: "answer",
-          answer: msg.answer
-        }));
-      }
-    }
-
-    if (msg.type === "ice") {
-      // 서로 전달
-      if (ws.isHost) {
-        room.peers.forEach(peer => {
-          if (peer.readyState === WebSocket.OPEN) {
-            peer.send(JSON.stringify({
-              type: "ice",
-              candidate: msg.candidate
-            }));
-          }
-        });
-      } else {
-        if (room.host && room.host.readyState === WebSocket.OPEN) {
-          room.host.send(JSON.stringify({
-            type: "ice",
-            candidate: msg.candidate
-          }));
-        }
+      if (target && target.readyState === WebSocket.OPEN) {
+        target.send(JSON.stringify(data));
       }
     }
   });
 
-  /* =========================
-     연결 종료
-  ========================= */
+  // ==========================
+  // 연결 종료
+  // ==========================
   ws.on("close", () => {
-    const room = rooms[ws.roomCode];
-    if (!room) return;
+    const code = ws.roomCode;
+    if (!code || !rooms[code]) return;
 
-    if (ws.isHost) {
-      // 방 폭파
-      room.peers.forEach(p => {
-        if (p.readyState === WebSocket.OPEN) {
-          p.close();
-        }
-      });
-      delete rooms[ws.roomCode];
-    } else {
-      room.peers.delete(ws);
+    const room = rooms[code];
+
+    // 호스트 나가면 방 삭제
+    if (ws.role === "host") {
+      if (room.guest && room.guest.readyState === WebSocket.OPEN) {
+        room.guest.send(JSON.stringify({
+          type: "error",
+          message: "호스트 연결 종료"
+        }));
+      }
+      delete rooms[code];
+    }
+
+    // 참가자 나가면 guest만 제거
+    if (ws.role === "guest") {
+      room.guest = null;
     }
   });
 });
 
-server.listen(PORT, () => {
-  console.log("Server running on", PORT);
-});
+console.log(`Signaling server running on port ${PORT}`);
