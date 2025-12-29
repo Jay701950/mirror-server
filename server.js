@@ -3,27 +3,35 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
 
-/* HTTP (Render용) */
+/* =========================
+   HTTP (상태 확인용)
+========================= */
 const server = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("WebSocket server running");
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Signaling server running");
 });
 
-/* WebSocket */
+/* =========================
+   WebSocket
+========================= */
 const wss = new WebSocket.Server({ server });
 
 /*
 rooms = {
   roomCode: {
-    clients: Set<WebSocket>,
-    offer: RTCSessionDescription
+    host: WebSocket,
+    peers: Set<WebSocket>
   }
 }
 */
 const rooms = {};
 
+/* =========================
+   연결
+========================= */
 wss.on("connection", (ws) => {
-  ws.room = null;
+  ws.roomCode = null;
+  ws.isHost = false;
 
   ws.on("message", (data) => {
     let msg;
@@ -33,53 +41,130 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    const { type, room } = msg;
+    /* =========================
+       방 생성
+    ========================= */
+    if (msg.type === "create-room") {
+      const roomCode = Math.random().toString(36).substring(2, 8);
 
-    /* ===== 참가 ===== */
-    if (type === "join") {
-      ws.room = room;
+      rooms[roomCode] = {
+        host: ws,
+        peers: new Set()
+      };
 
-      if (!rooms[room]) {
-        rooms[room] = {
-          clients: new Set(),
-          offer: null
-        };
-      }
+      ws.roomCode = roomCode;
+      ws.isHost = true;
 
-      rooms[room].clients.add(ws);
+      ws.send(JSON.stringify({
+        type: "room-created",
+        roomCode
+      }));
 
-      /* 🔥 핵심: 이미 공유 중이면 offer 즉시 전송 */
-      if (rooms[room].offer) {
-        ws.send(JSON.stringify({
-          type: "offer",
-          offer: rooms[room].offer
-        }));
-      }
       return;
     }
 
-    if (!ws.room || !rooms[ws.room]) return;
+    /* =========================
+       방 참가
+    ========================= */
+    if (msg.type === "join-room") {
+      const room = rooms[msg.roomCode];
+      if (!room) {
+        ws.send(JSON.stringify({
+          type: "error",
+          message: "Room not found"
+        }));
+        return;
+      }
 
-    /* ===== offer 저장 ===== */
-    if (type === "offer") {
-      rooms[ws.room].offer = msg.offer;
+      ws.roomCode = msg.roomCode;
+      ws.isHost = false;
+      room.peers.add(ws);
+
+      ws.send(JSON.stringify({
+        type: "joined-room",
+        roomCode: msg.roomCode
+      }));
+
+      /* 🔥 호스트에게 참가 알림 */
+      if (room.host && room.host.readyState === WebSocket.OPEN) {
+        room.host.send(JSON.stringify({
+          type: "peer-joined"
+        }));
+      }
+
+      return;
     }
 
-    /* ===== 방 안에 중계 ===== */
-    rooms[ws.room].clients.forEach(client => {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify(msg));
+    /* =========================
+       이후는 방 필요
+    ========================= */
+    const room = rooms[ws.roomCode];
+    if (!room) return;
+
+    /* =========================
+       WebRTC 중계
+    ========================= */
+    if (msg.type === "offer") {
+      // host → peers
+      room.peers.forEach(peer => {
+        if (peer.readyState === WebSocket.OPEN) {
+          peer.send(JSON.stringify({
+            type: "offer",
+            offer: msg.offer
+          }));
+        }
+      });
+    }
+
+    if (msg.type === "answer") {
+      // peer → host
+      if (room.host && room.host.readyState === WebSocket.OPEN) {
+        room.host.send(JSON.stringify({
+          type: "answer",
+          answer: msg.answer
+        }));
       }
-    });
+    }
+
+    if (msg.type === "ice") {
+      // 서로 전달
+      if (ws.isHost) {
+        room.peers.forEach(peer => {
+          if (peer.readyState === WebSocket.OPEN) {
+            peer.send(JSON.stringify({
+              type: "ice",
+              candidate: msg.candidate
+            }));
+          }
+        });
+      } else {
+        if (room.host && room.host.readyState === WebSocket.OPEN) {
+          room.host.send(JSON.stringify({
+            type: "ice",
+            candidate: msg.candidate
+          }));
+        }
+      }
+    }
   });
 
+  /* =========================
+     연결 종료
+  ========================= */
   ws.on("close", () => {
-    const room = ws.room;
-    if (!room || !rooms[room]) return;
+    const room = rooms[ws.roomCode];
+    if (!room) return;
 
-    rooms[room].clients.delete(ws);
-    if (rooms[room].clients.size === 0) {
-      delete rooms[room];
+    if (ws.isHost) {
+      // 방 폭파
+      room.peers.forEach(p => {
+        if (p.readyState === WebSocket.OPEN) {
+          p.close();
+        }
+      });
+      delete rooms[ws.roomCode];
+    } else {
+      room.peers.delete(ws);
     }
   });
 });
